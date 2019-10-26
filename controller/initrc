@@ -1,0 +1,161 @@
+#!/bin/sh -e
+
+await ${DB_HOST} ${DB_PORT}
+
+HOST_IP_ADDRESS=$(hostname -i | sed 's@\s.*$@@')
+export HOST_IP_ADDRESS
+
+# - Process templates -
+for tpl_file in `find /etc -name "*.tpl"`; do
+  out_file=$(echo ${tpl_file} | sed 's@\.tpl$@@')
+  echo "Processing config file: ${out_file}"
+  mv ${out_file} "${out_file}.orig"
+  envar ${tpl_file} > ${out_file}
+done
+
+# - Memcached -
+service memcached start
+
+# - RabbitMQ -
+chown -R rabbitmq:rabbitmq /var/lib/rabbitmq
+service rabbitmq-server start
+[ $(rabbitmqctl list_users | grep -c "\b${OS_MASTER_USERNAME}\b") -lt 1 ] && {
+  echo -n " * Creating RabbitMQ master user... "
+  rabbitmqctl -q add_user ${OS_MASTER_USERNAME} ${OS_MASTER_PASSWORD}
+  rabbitmqctl -q set_permissions ${OS_MASTER_USERNAME} ".*" ".*" ".*"
+  echo "done."
+}
+
+# - Etcd -
+service etcd start
+
+# - Prepare MySQL client -
+cat << EOF > ~/.my.cnf
+[client]
+host=${DB_HOST}
+port=${DB_PORT}
+user=${OS_MASTER_USERNAME}
+password=${OS_MASTER_PASSWORD}
+EOF
+MYSQL="mysql --defaults-extra-file=~/.my.cnf -ss"
+
+# - Keystone -
+#envar /etc/keystone/keystone.conf.tpl > /etc/keystone/keystone.conf
+[ $($MYSQL -e "SHOW DATABASES;" | grep -c "\b${KEYSTONE_IDENTITY}\b") -lt 1 ] && {
+  echo " * Initializing Keystone... "
+  $MYSQL -e "CREATE DATABASE ${KEYSTONE_IDENTITY};"
+  keystone-manage db_sync
+  chmod 0755 /etc/keystone/fernet-keys
+  chown -R keystone /etc/keystone/fernet-keys
+  keystone-manage fernet_setup --keystone-user keystone --keystone-group keystone
+  keystone-manage credential_setup --keystone-user keystone --keystone-group keystone
+  keystone-manage bootstrap --bootstrap-password ${OS_PASSWORD} \
+    --bootstrap-admin-url http://controller:5000/v3/ \
+    --bootstrap-internal-url http://controller:5000/v3/ \
+    --bootstrap-public-url http://controller:5000/v3/ \
+    --bootstrap-region-id ${DEFAULT_REGION}
+  echo "   done."
+}
+service apache2 start
+
+[ $(openstack project list | grep -c "\bservice\b") -lt 1 ] && {
+  echo " * Creating 'service' project..."
+  openstack project create --domain default --description "Service Project" service
+  echo "   done."
+}
+
+# - Glance -
+#envar /etc/glance/glance-api.conf.tpl > /etc/glance/glance-api.conf
+[ $($MYSQL -e "SHOW DATABASES;" | grep -c "\b${GLANCE_IDENTITY}\b") -lt 1 ] && {
+  echo " * Initializing Glance... "
+  $MYSQL -e "CREATE DATABASE ${GLANCE_IDENTITY};"
+  openstack user create --domain default --password ${OS_MASTER_PASSWORD} ${GLANCE_IDENTITY}
+  openstack role add --project service --user ${GLANCE_IDENTITY} admin
+  openstack service create --name ${GLANCE_IDENTITY} --description "OpenStack Image" image
+  openstack endpoint create --region ${DEFAULT_REGION} image public http://controller:9292
+  openstack endpoint create --region ${DEFAULT_REGION} image internal http://controller:9292
+  openstack endpoint create --region ${DEFAULT_REGION} image admin http://controller:9292
+  glance-manage db_sync
+  echo "   done."
+}
+mkdir -p /tmp/staging
+chown glance:glance /tmp/staging
+# service glance-registry start
+service glance-api start
+
+# - Placement -
+#envar /etc/placement/placement.conf.tpl > /etc/placement/placement.conf
+[ $($MYSQL -e "SHOW DATABASES;" | grep -c "\b${PLACEMENT_IDENTITY}\b") -lt 1 ] && {
+  echo " * Initializing Placement... "
+  $MYSQL -e "CREATE DATABASE ${PLACEMENT_IDENTITY};"
+  openstack user create --domain default --password ${OS_MASTER_PASSWORD} ${PLACEMENT_IDENTITY}
+  openstack role add --project service --user ${PLACEMENT_IDENTITY} admin
+  openstack service create --name ${PLACEMENT_IDENTITY} --description "OpenStack Placement" placement
+  openstack endpoint create --region ${DEFAULT_REGION} placement public http://controller:8778
+  openstack endpoint create --region ${DEFAULT_REGION} placement internal http://controller:8778
+  openstack endpoint create --region ${DEFAULT_REGION} placement admin http://controller:8778
+  placement-manage db sync
+  service apache2 restart
+  echo "   done."
+}
+
+# - Nova -
+#envar /etc/nova/nova.conf.tpl > /etc/nova/nova.conf
+[ $($MYSQL -e "SHOW DATABASES;" | grep -c "\b${NOVA_IDENTITY}\b") -lt 1 ] && {
+  echo " * Initializing Nova API... "
+  $MYSQL -e "CREATE DATABASE ${NOVA_IDENTITY};"
+  $MYSQL -e "DROP DATABASE IF EXISTS ${NOVA_IDENTITY}_api;"
+  $MYSQL -e "CREATE DATABASE ${NOVA_IDENTITY}_api;"
+  $MYSQL -e "DROP DATABASE IF EXISTS ${NOVA_IDENTITY}_cell0;"
+  $MYSQL -e "CREATE DATABASE ${NOVA_IDENTITY}_cell0;"
+  openstack user create --domain default --password ${OS_MASTER_PASSWORD} ${NOVA_IDENTITY}
+  openstack role add --project service --user ${NOVA_IDENTITY} admin
+  openstack service create --name ${NOVA_IDENTITY} --description "OpenStack Compute" compute
+  openstack endpoint create --region ${DEFAULT_REGION} compute public http://controller:8774/v2.1
+  openstack endpoint create --region ${DEFAULT_REGION} compute internal http://controller:8774/v2.1
+  openstack endpoint create --region ${DEFAULT_REGION} compute admin http://controller:8774/v2.1
+  nova-manage api_db sync
+  nova-manage cell_v2 map_cell0
+  nova-manage cell_v2 create_cell --name=cell1 --verbose
+  nova-manage db sync
+  # verify
+  nova-manage cell_v2 list_cells
+  echo "   done."
+}
+service nova-api start
+service nova-scheduler start
+service nova-conductor start
+service nova-novncproxy start
+
+# - Neutron -
+[ $($MYSQL -e "SHOW DATABASES;" | grep -c "\b${NEUTRON_IDENTITY}\b") -lt 1 ] && {
+  echo " * Initializing Neutron... "
+  $MYSQL -e "CREATE DATABASE ${NEUTRON_IDENTITY};"
+  openstack user create --domain default --password ${OS_MASTER_PASSWORD} ${NEUTRON_IDENTITY}
+  openstack role add --project service --user ${NEUTRON_IDENTITY} admin
+  openstack service create --name ${NEUTRON_IDENTITY} --description "OpenStack Networking" network
+  openstack endpoint create --region ${DEFAULT_REGION} network public http://controller:9696
+  openstack endpoint create --region ${DEFAULT_REGION} network internal http://controller:9696
+  openstack endpoint create --region ${DEFAULT_REGION} network admin http://controller:9696
+  neutron-db-manage --config-file /etc/neutron/neutron.conf --config-file /etc/neutron/plugins/ml2/ml2_conf.ini upgrade head
+  service nova-api restart
+  echo "   done."
+}
+service neutron-server start
+service neutron-linuxbridge-agent start
+service neutron-dhcp-agent start
+service neutron-metadata-agent start
+service neutron-l3-agent start
+
+# [] {
+#   openstack network create --share --external --provider-physical-network provider --provider-network-type flat provider
+# }
+
+# - Horizon -
+[ $(grep -c "WSGIApplicationGroup %{GLOBAL}" /etc/apache2/conf-available/openstack-dashboard.conf) -lt 1 ] && {
+  echo "WSGIApplicationGroup %{GLOBAL}" >> /etc/apache2/conf-available/openstack-dashboard.conf
+}
+
+# - Ready -
+echo ">>> OpenStack controller is ready <<<"
+exec sleep infinity

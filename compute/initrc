@@ -1,0 +1,22 @@
+#!/bin/sh -e
+
+await controller 8774
+
+HOST_IP_ADDRESS=$(hostname -i | sed 's@\s.*$@@')
+export HOST_IP_ADDRESS
+
+# - Process templates -
+for tpl_file in `find /etc -name "*.tpl"`; do
+  out_file=$(echo ${tpl_file} | sed 's@\.tpl$@@')
+  echo "Processing config file: ${out_file}"
+  mv ${out_file} "${out_file}.orig"
+  envar ${tpl_file} > ${out_file}
+done
+
+libvirtd -d
+service nova-compute start
+service neutron-linuxbridge-agent start
+
+# - Ready -
+echo ">>> OpenStack compute node is ready <<<"
+exec sleep infinity

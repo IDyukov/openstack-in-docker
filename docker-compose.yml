@@ -1,0 +1,109 @@
+version: "3.5"
+
+#
+# - Networks Definition -
+#
+networks:
+
+  # management (internal) network
+  management:
+    name: ${PREFIX}_management
+    ipam:
+      driver: default
+      config:
+        - subnet: 10.10.10.0/24
+
+  # provider (external) network
+  provider:
+    name: ${PREFIX}_provider
+    ipam:
+      driver: bridge
+
+#
+# - Persistence & Volumes -
+#
+volumes:
+  etcd:
+    name: ${PREFIX}_etcd
+  fernet-keys:
+    name: ${PREFIX}_fernet-keys
+  glance:
+    name: ${PREFIX}_glance
+  neutron:
+    name: ${PREFIX}_neutron
+  neutron-compute:
+    name: ${PREFIX}_neutron-compute
+  nova:
+    name: ${PREFIX}_nova
+  nova-compute:
+    name: ${PREFIX}_nova-compute
+  mariadb:
+    name: ${PREFIX}_mariadb
+  rabbitmq:
+    name: ${PREFIX}_rabbitmq
+
+#
+# - Services Definition -
+#
+services:
+
+  database:
+    container_name: ${PREFIX}_database
+    image: ${PREFIX}/database
+    hostname: database
+    build:
+      context: database
+      args:
+        - ORIGIN_IMAGE
+        - OS_MASTER_USERNAME
+        - OS_MASTER_PASSWORD
+    volumes:
+      - mariadb:/var/lib/mysql
+    networks:
+      - management
+      - provider
+
+  controller:
+    privileged: true
+    container_name: ${PREFIX}_controller
+    image: ${PREFIX}/controller
+    hostname: controller
+    build:
+      context: controller
+      args:
+        - PREFIX
+    env_file: .env
+    volumes:
+      - etcd:/var/lib/etcd
+      - fernet-keys:/etc/keystone/fernet-keys
+      - glance:/var/lib/glance
+      - neutron:/var/lib/neutron
+      - nova:/var/lib/nova
+      - rabbitmq:/var/lib/rabbitmq
+    networks:
+      - management
+      - provider
+    ports:
+      - "80:80"
+    depends_on:
+      - database
+      #- storage
+
+  compute:
+    privileged: true
+    container_name: ${PREFIX}_compute
+    image: ${PREFIX}/compute
+    hostname: compute
+    build:
+      context: compute
+      args:
+        - PREFIX
+    env_file: .env
+    volumes:
+      - neutron-compute:/var/lib/neutron
+      - nova-compute:/var/lib/nova
+    networks:
+      - management
+      - provider
+    depends_on:
+      - controller

@@ -1,0 +1,16 @@
+#!/bin/sh -e
+
+[ -z "$1" -o -z "$2" ] && {
+  echo "Usage: ${0} <host> <port> [<sleep>=5 [timeout=infinity]]"
+  exit 1
+}
+
+S=$3 && [ -z "$S" ] && S=5
+T=$4
+
+while ! nc -z $1 $2; do
+  sleep $S
+  [ ! -z "$4" ] && T=$((T-S)) && [ $T -le 0 ] && exit 2
+done
+
+exit 0
